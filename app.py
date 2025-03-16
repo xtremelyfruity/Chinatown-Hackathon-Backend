@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 import pytesseract
 import tempfile
-import whisper  # Make sure to install OpenAI's whisper: pip install git+https://github.com/openai/whisper.git
+import whisper  # pip install git+https://github.com/openai/whisper.git
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -22,12 +22,23 @@ CORS(app)  # Allow cross-origin requests if React is on a different port
 # -----------------------------
 
 # Tesseract path (update as needed)
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\19253\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Users\19253\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+)
 
-# API Keys (hardcoded here for demonstration; better to use environment variables)
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "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")
-TWELVE_LABS_API_KEY = os.getenv("TWELVE_LABS_API_KEY", "tlk_398YQW921F6JBK2ARCPKG34FJF87")
-TWELVE_LABS_INDEX_ID = os.getenv("TWELVE_LABS_INDEX_ID", "67d70b3895d40cc75f6a64db")
+# API Keys (use environment variables in production)
+ANTHROPIC_API_KEY = os.getenv(
+    "ANTHROPIC_API_KEY",
+    "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"
+)
+TWELVE_LABS_API_KEY = os.getenv(
+    "TWELVE_LABS_API_KEY",
+    "tlk_398YQW921F6JBK2ARCPKG34FJF87"
+)
+TWELVE_LABS_INDEX_ID = os.getenv(
+    "TWELVE_LABS_INDEX_ID",
+    "67d70b3895d40cc75f6a64db"
+)
 
 # Allowed file extensions for OCR (images) and speech (audio)
 ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "tiff", "bmp", "gif"}
@@ -36,7 +47,7 @@ ALLOWED_AUDIO_EXTENSIONS = {"wav", "mp3", "m4a", "ogg"}
 # -----------------------------
 # 2. Load Models
 # -----------------------------
-# Load the small Whisper model for speech-to-text (supports English, Chinese, and more)
+# Load the small Whisper model for speech-to-text (supports English, Chinese, etc.)
 whisper_model = whisper.load_model("small")
 
 # -----------------------------
@@ -63,23 +74,44 @@ def preprocess_image(image_np):
     )
     return thresh
 
-def call_anthropic_claude(prompt):
+def build_claude_messages(ocr_text: str, user_input: str = ""):
     """
-    Sends the prompt to Anthropic Claude’s API and returns the JSON response.
-    Includes the required `anthropic-version` header.
+    Returns a list of message objects suitable for Anthropic's Messages API.
+    We'll keep it simple: system instructions plus user content.
     """
-    url = "https://api.anthropic.com/v1/complete"
+    
+
+    if user_input.strip():
+        user_content = (
+            f"The user has provided the following text from a federal document:\n{ocr_text}\n\n"
+            f"They also wrote this additional prompt:\n{user_input}\n"
+        )
+    else:
+        user_content = (
+            f"The user has provided the following text from a federal document:\n{ocr_text}\n"
+        )
+
+    return [
+        {"role": "user", "content": user_content}
+    ]
+
+def call_anthropic_claude_messages(messages):
+    """
+    Sends messages to Anthropic's Claude using the v1/messages endpoint
+    (for Claude 3 models and newer).
+    """
+    url = "https://api.anthropic.com/v1/messages"
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
         "Content-Type": "application/json",
-        "anthropic-version": "2023-06-01"  # Required by Anthropic
+        "anthropic-version": "2023-06-01"
     }
     payload = {
-        "prompt": prompt,
-        "model": "claude-3-7-sonnet-20250219",  # Use a valid model name
-        "max_tokens_to_sample": 300,
+        "model": "claude-3-sonnet-20240229",  # Or another Claude 3 model
+        "messages": messages,
+        "max_tokens": 300,
         "temperature": 0.7,
-        "stop_sequences": ["\n\nHuman:"],
+        "system" : "You are a helpful assistant specialized in analyzing federal documents. Explain what the document is about and how to fill it out."
     }
     response = requests.post(url, headers=headers, json=payload)
     if response.status_code == 200:
@@ -87,58 +119,26 @@ def call_anthropic_claude(prompt):
     else:
         raise ValueError(f"Anthropic API Error: {response.status_code} {response.text}")
 
-def build_claude_prompt(ocr_text, user_input=""):
-    """
-    Build a conversation-format prompt for Anthropic, with a system message,
-    a human message (containing the OCR text), and an optional user input.
-    Ends with 'Assistant:' so Anthropic knows where to continue.
-    """
-    system_instructions = (
-        "System: You are a helpful assistant specialized in analyzing federal documents. "
-        "Explain what the document is about and how to fill it out.\n"
-    )
-    if user_input.strip():
-        human_part = (
-            f"Human: The user has provided the following text from a federal document:\n"
-            f"{ocr_text}\n\n"
-            f"They also wrote this additional prompt:\n"
-            f"{user_input}\n\n"
-        )
-    else:
-        human_part = (
-            f"Human: The user has provided the following text from a federal document:\n"
-            f"{ocr_text}\n\n"
-        )
-    assistant_part = "Assistant:"
-    prompt = f"{system_instructions}\n{human_part}\n{assistant_part}"
-    return prompt
-
-"""
-def call_elevenlabs_tts(text_content):
-    # This function has been removed as per requirements.
-"""
-
 def call_twelve_labs_video_analysis(video_path):
     """
     Calls Twelve Labs API to analyze the provided video file.
-    This function creates a video indexing task on Twelve Labs.
     Ensure that your environment has TWELVE_LABS_API_KEY and TWELVE_LABS_INDEX_ID set.
     """
     TASKS_URL = "https://api.twelvelabs.io/v1/tasks"
     headers = {"x-api-key": TWELVE_LABS_API_KEY}
     data = {
-         "index_id": TWELVE_LABS_INDEX_ID,
-         "language": "en"
+        "index_id": TWELVE_LABS_INDEX_ID,
+        "language": "en"
     }
     with open(video_path, "rb") as f:
-         files = {
-              "video_file": (os.path.basename(video_path), f, "application/octet-stream")
-         }
-         response = requests.post(TASKS_URL, headers=headers, data=data, files=files)
-         if response.status_code == 201:
-             return response.json()  # Contains details about the created task.
-         else:
-             raise ValueError(f"Twelve Labs API Error: {response.status_code} {response.text}")
+        files = {
+            "video_file": (os.path.basename(video_path), f, "application/octet-stream")
+        }
+        response = requests.post(TASKS_URL, headers=headers, data=data, files=files)
+        if response.status_code == 201:
+            return response.json()  # Contains details about the created task
+        else:
+            raise ValueError(f"Twelve Labs API Error: {response.status_code} {response.text}")
 
 # -----------------------------
 # 4. Endpoints
@@ -148,8 +148,7 @@ def call_twelve_labs_video_analysis(video_path):
 def extract_text_and_call_claude():
     """
     Endpoint for processing an uploaded file or text-only:
-      - If an image file is uploaded: runs OCR, builds a prompt with optional user text,
-        calls Anthropic Claude's API, and returns the combined response.
+      - If an image file is uploaded: runs Tesseract OCR, then calls Anthropic Claude-2.
       - If an MP4 video is uploaded: sends the full video file to Twelve Labs for analysis.
       - If no file is provided: sends the user's text alone to Claude.
     """
@@ -164,9 +163,8 @@ def extract_text_and_call_claude():
     # If no file is provided or filename is empty, process text-only.
     if not file or file.filename == '':
         try:
-            # Build prompt with no OCR text
-            claude_prompt = build_claude_prompt("", user_input)
-            claude_response = call_anthropic_claude(claude_prompt)
+            messages = build_claude_messages("", user_input)
+            claude_response = call_anthropic_claude_messages(messages)
             return jsonify({
                 "type": "text_only",
                 "message": user_input,
@@ -180,7 +178,7 @@ def extract_text_and_call_claude():
 
     file_extension = file.filename.rsplit('.', 1)[1].lower()
 
-    # Video file scenario: process MP4 using Twelve Labs API.
+    # Video file scenario: process MP4 using Twelve Labs API
     if file_extension == "mp4":
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
             tmp_video.write(file.read())
@@ -202,18 +200,25 @@ def extract_text_and_call_claude():
             except Exception:
                 pass
 
-    # Image file scenario: run OCR and call Claude.
+    # Image file scenario: run Tesseract OCR and call Claude
     elif allowed_file(file.filename, ALLOWED_IMAGE_EXTENSIONS):
         try:
-            image_pil = Image.open(io.BytesIO(file.read())).convert("L")
+            # Read file contents once
+            file_data = file.read()
+            image_pil = Image.open(io.BytesIO(file_data)).convert("L")
             image_np = np.array(image_pil)
             processed_image = preprocess_image(image_np)
             ocr_text = pytesseract.image_to_string(processed_image).strip()
-            claude_prompt = build_claude_prompt(ocr_text, user_input)
-            claude_response = call_anthropic_claude(claude_prompt)
+            print("OCR Text:", ocr_text)
+            print("USER INPUT", user_input)
+
+            # Build messages using the OCR text and any additional user input
+            messages = build_claude_messages(ocr_text, user_input)
+            print(messages)
+            claude_response = call_anthropic_claude_messages(messages)
 
             print("----- OCR & Claude Response -----")
-            print("Prompt:\n", claude_prompt)
+            print("Messages:\n", json.dumps(messages, indent=2))
             print("Claude Response:\n", json.dumps(claude_response, indent=2))
             print("----------------------------------")
 
@@ -234,7 +239,7 @@ def extract_text_and_call_claude():
 def speak_text():
     """
     Endpoint for text-to-speech conversion:
-      - This endpoint has been disabled/removed as per your requirements.
+      - This endpoint is disabled for now.
     """
     return jsonify({"error": "Endpoint disabled"}), 404
 
@@ -248,6 +253,7 @@ def transcribe_audio():
     """
     print("----- /mic Request Debug Info -----")
     print("request.files keys:", list(request.files.keys()))
+    print("request.form:", request.form)
     print("-------------------------------------")
 
     if 'file' not in request.files:
@@ -296,4 +302,5 @@ def transcribe_audio():
 # 5. Main
 # -----------------------------
 if __name__ == '__main__':
+    # For local debugging only. In production, use a proper WSGI server.
     app.run(debug=True, host='0.0.0.0', port=5000)
