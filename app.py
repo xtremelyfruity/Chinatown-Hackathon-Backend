@@ -10,6 +10,10 @@ import tempfile
 import whisper  # Make sure to install OpenAI's whisper: pip install git+https://github.com/openai/whisper.git
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 app = Flask(__name__)
 CORS(app)  # Allow cross-origin requests if React is on a different port
@@ -22,11 +26,11 @@ CORS(app)  # Allow cross-origin requests if React is on a different port
 pytesseract.pytesseract.tesseract_cmd = r"C:\Users\19253\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 
 # Anthropic API key (replace or set via environment variable)
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "YOUR_ANTHROPIC_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+#ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
 
 # Eleven Labs API configuration (replace or set via environment variables)
-ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY", "YOUR_ELEVEN_LABS_API_KEY")
-ELEVEN_LABS_VOICE_ID = os.getenv("ELEVEN_LABS_VOICE_ID", "YOUR_VOICE_ID")
+#ELEVEN_LABS_VOICE_ID = os.getenv("ELEVEN_LABS_VOICE_ID", "YOUR_VOICE_ID")
 
 # Allowed file extensions for OCR (images) and speech (audio)
 ALLOWED_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "tiff", "bmp", "gif"}
@@ -116,11 +120,12 @@ def build_claude_prompt(ocr_text, user_input=""):
     prompt = f"{system_instructions}\n{human_part}\n{assistant_part}"
     return prompt
 
+"""
 def call_elevenlabs_tts(text_content):
-    """
+    
     Sends text content to the Eleven Labs API for text-to-speech conversion.
     Returns the generated audio content.
-    """
+    
     headers = {
         "Accept": "audio/mpeg",
         "Content-Type": "application/json",
@@ -140,6 +145,31 @@ def call_elevenlabs_tts(text_content):
     else:
         raise ValueError(f"Eleven Labs API Error: {response.status_code} {response.text}")
 
+"""
+def call_twelve_labs_video_analysis(video_path):
+    """
+    Calls Twelve Labs API to analyze the provided video file.
+    This function creates a video indexing task on Twelve Labs.
+    Ensure that your environment has TWELVE_LABS_API_KEY and TWELVE_LABS_INDEX_ID set.
+    """
+    TWELVE_LABS_API_KEY = os.getenv("TWELVE_LABS_API_KEY")
+    TWELVE_LABS_INDEX_ID = os.getenv("TWELVE_LABS_INDEX_ID")
+    TASKS_URL = "https://api.twelvelabs.io/v1/tasks"
+    headers = {"x-api-key": TWELVE_LABS_API_KEY}
+    data = {
+         "index_id": TWELVE_LABS_INDEX_ID,
+         "language": "en"
+    }
+    with open(video_path, "rb") as f:
+         files = {
+              "video_file": (os.path.basename(video_path), f, "application/octet-stream")
+         }
+         response = requests.post(TASKS_URL, headers=headers, data=data, files=files)
+         if response.status_code == 201:
+             return response.json()  # Contains details about the created task.
+         else:
+             raise ValueError(f"Twelve Labs API Error: {response.status_code} {response.text}")
+
 # -----------------------------
 # 4. Endpoints
 # -----------------------------
@@ -147,10 +177,11 @@ def call_elevenlabs_tts(text_content):
 @app.route('/ocr', methods=['POST'])
 def extract_text_and_call_claude():
     """
-    Endpoint for processing an image file:
-      - Runs OCR on the image.
-      - Builds a prompt with optional user input.
-      - Calls Anthropic Claude's API.
+    Endpoint for processing an uploaded file.
+      - For image files: Runs OCR on the image, builds a prompt with optional user input,
+        and calls Anthropic Claude's API.
+      - For MP4 video files: Sends the full video file to Twelve Labs API for analysis and
+        returns the task details.
     """
     print("----- /ocr Request Debug Info -----")
     print("request.files keys:", list(request.files.keys()))
@@ -164,32 +195,55 @@ def extract_text_and_call_claude():
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
 
-    if not allowed_file(file.filename, ALLOWED_IMAGE_EXTENSIONS):
+    file_extension = file.filename.rsplit('.', 1)[1].lower()
+
+    # If the file is a video (.mp4), send the full file to Twelve Labs for analysis.
+    if file_extension == "mp4":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+            tmp_video.write(file.read())
+            video_path = tmp_video.name
+
+        try:
+            twelve_labs_response = call_twelve_labs_video_analysis(video_path)
+            # Return the task details from Twelve Labs (analysis will be asynchronous)
+            return jsonify({
+                "type": "video_analysis",
+                "twelve_labs_response": twelve_labs_response
+            })
+        except Exception as e:
+            return jsonify({"error": "Failed to analyze video with Twelve Labs", "details": str(e)}), 500
+        finally:
+            try:
+                os.remove(video_path)
+            except Exception:
+                pass
+
+    # Otherwise, if the file is an image, process OCR and call Claude as before.
+    elif allowed_file(file.filename, ALLOWED_IMAGE_EXTENSIONS):
+        user_input = request.form.get('message', '')
+        try:
+            image_pil = Image.open(io.BytesIO(file.read())).convert("L")
+            image_np = np.array(image_pil)
+            processed_image = preprocess_image(image_np)
+            ocr_text = pytesseract.image_to_string(processed_image).strip()
+
+            claude_prompt = build_claude_prompt(ocr_text, user_input)
+            claude_response = call_anthropic_claude(claude_prompt)
+
+            print("----- OCR & Claude Response -----")
+            print("Prompt:\n", claude_prompt)
+            print("Claude Response:\n", json.dumps(claude_response, indent=2))
+            print("----------------------------------")
+
+            return jsonify({
+                "type": "ocr",
+                "ocr_text": ocr_text,
+                "claude_response": claude_response
+            })
+        except Exception as e:
+            return jsonify({"error": "Failed to process image", "details": str(e)}), 500
+    else:
         return jsonify({"error": "Unsupported file format for OCR"}), 400
-
-    user_input = request.form.get('message', '')
-
-    try:
-        image_pil = Image.open(io.BytesIO(file.read())).convert("L")
-        image_np = np.array(image_pil)
-        processed_image = preprocess_image(image_np)
-        ocr_text = pytesseract.image_to_string(processed_image).strip()
-
-        claude_prompt = build_claude_prompt(ocr_text, user_input)
-        claude_response = call_anthropic_claude(claude_prompt)
-
-        print("----- OCR & Claude Response -----")
-        print("Prompt:\n", claude_prompt)
-        print("Claude Response:\n", json.dumps(claude_response, indent=2))
-        print("----------------------------------")
-
-        return jsonify({
-            "type": "ocr",
-            "ocr_text": ocr_text,
-            "claude_response": claude_response
-        })
-    except Exception as e:
-        return jsonify({"error": "Failed to process image", "details": str(e)}), 500
 
 @app.route('/speak', methods=['POST'])
 def speak_text():
@@ -208,8 +262,9 @@ def speak_text():
     if not text_content:
         return jsonify({"error": "No text provided"}), 400
 
+    """
     try:
-        audio_content = call_elevenlabs_tts(text_content)
+        #audio_content = call_elevenlabs_tts(text_content)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as audio_temp:
             audio_temp.write(audio_content)
             audio_temp_path = audio_temp.name
@@ -217,13 +272,14 @@ def speak_text():
         # Send the generated audio file to the client
         return send_file(audio_temp_path, mimetype="audio/mpeg")
     except Exception as e:
-        return jsonify({"error": "Failed to process text-to-speech", "details": str(e)}), 500
+        return jsonify({"error": "Failed to process text-to-speech", "details": str(e)}), 
+    
     finally:
         try:
             os.remove(audio_temp_path)
         except Exception:
             pass
-
+"""
 @app.route('/mic', methods=['POST'])
 def transcribe_audio():
     """
